@@ -342,6 +342,15 @@ def main():
     )
     logger.info(f"Refusal direction norm: {chat_refusal_dir.norm().item():.4f}")
 
+    # 5. Optional: Compute SAE-based directions
+    sae_dirs = extract_refusal_direction_bottom_up(
+        model=model,
+        layer=layer_of_interest,
+        pos=pos_of_interest,
+        harmful_batch=harmful_toks,
+        harmless_batch=harmless_toks,
+        sae=sae
+    )
     logger.info(f"Computed {len(sae_dirs)} SAE-based directions: {list(sae_dirs.keys())}")
 
     # 6. Demonstrate hooking with "chat_refusal_dir" in subtract mode
@@ -349,19 +358,47 @@ def main():
     instructions_to_test = harmful_inst_test[:2]
     test_toks = tokenize_fn(instructions_to_test)
 
-    # Define your forward hook. We'll do subtracting the projection:
-    def fwd_hook_fun(acts, hook):
-        return steering_fn(
-            activations=acts,
-            hook=hook,
-            steering_vector=chat_refusal_dir.to(acts.device),
-            mode="subtract_projection",  # or "add_projection"
-        )
+    # Run steering with different modes
+    steering_feature = 18316
+    steering_vector = sae.W_dec[steering_feature].to(model.cfg.device)
+    sae_steer = partial(
+        steering_fn,
+        direction=None,
+        steering_vector=steering_vector,
+        steering_strength=3.,
+        max_act=1.407,
+        mode="add"
+    )
+    top_down_steer = partial(
+        steering_fn,
+        direction=chat_refusal_dir.to(model.cfg.device)/chat_refusal_dir.norm(),
+        steering_vector=None,
+        mode="subtract_projection"
+    )
+    hybrid_steer = partial(
+        steering_fn,
+        direction=chat_refusal_dir.to(model.cfg.device)/chat_refusal_dir.norm(),
+        steering_vector=steering_vector,
+        steering_strength=2.,
+        max_act=1.407,
+        mode="add_act_subtract_projection"
+    )
 
+    sae_td_steers = {}
+    for sae_dir_name, sae_dir in sae_dirs.items():
+        sae_td_steers[sae_dir_name] = partial(
+                steering_fn,
+                direction=sae_dir.to(model.cfg.device)/sae_dir.norm(),
+                steering_vector=None,
+                mode="subtract_projection"
+            )
     # We'll apply that hook at the same layer the direction was found
     # (using 'resid_pre' naming from transformer_lens)
-    fwd_hooks = [(utils.get_act_name('resid_pre', layer_of_interest), fwd_hook_fun)]
-
+    fwd_hooks = {'top_down': [(utils.get_act_name('resid_pre', layer_of_interest), top_down_steer)],
+                 'hybrid': [(utils.get_act_name('resid_pre', layer_of_interest), hybrid_steer)],
+                 'sae': [(utils.get_act_name('resid_pre', layer_of_interest), sae_steer)]}
+    for sae_dir_name in sae_td_steers:
+        fwd_hooks[sae_dir_name] = [(utils.get_act_name('resid_pre', layer_of_interest), sae_td_steers[sae_dir_name])]
     # 7. Generate with no steering
     logger.info("=== Generating baseline completions (no steering) ===")
     baseline = generate_with_hooks(
