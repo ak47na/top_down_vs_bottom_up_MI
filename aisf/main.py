@@ -13,12 +13,14 @@ This script demonstrates how to:
 Author: [Your Name / Organization]
 """
 
+import argparse
 import os
 import logging
 import json
-import functools
+from functools import partial
 import gc
 from typing import List, Callable
+from utils import get_harmful_instructions, get_harmless_instructions, QWEN_CHAT_TEMPLATE, tokenize_instructions
 
 import numpy as np
 import torch
@@ -118,14 +120,14 @@ def extract_refusal_direction_bottom_up(
     harmful_batch: torch.Tensor,
     harmless_batch: torch.Tensor,
     sae: SAE,
-) -> torch.Tensor:
+) -> dict:
     # 5. Optional: Compute SAE-based directions
     #    We just do it for the mean harmful/harmless single vectors here:
     harmful_acts, harmless_acts = extract_harmful_harmless_acts(model=model, layer=layer, pos=pos,
                                                                 harmful_batch=harmful_batch, 
                                                                 harmless_batch=harmless_batch)
     sae_dirs = compute_sae_directions(sae, harmful_acts, harmless_acts)
-    logger.info(f"Computed {len(sae_dirs)} SAE-based directions: {list(sae_dirs.keys())}") 
+    return sae_dirs
 
 
 def extract_harmful_harmless_acts(
@@ -303,7 +305,10 @@ def generate_with_hooks(
 # --------------------------------------------------------------------------------
 # 5. Main or Demo Function
 # --------------------------------------------------------------------------------
-def main():
+def main(wandb_api_key: str = None):
+    if wandb_api_key:
+        os.environ["WANDB_API_KEY"] = wandb_api_key
+        wandb.login(key=wandb_api_key)
     # 1. Configuration (tweak these as you wish)
     qwen_model_name = "qwen1.5-0.5b-chat"
     artifact_path = "ckkissane/qwen-500M-chat-lmsys-1m-anthropic/sae_qwen1.5-0.5b-chat_blocks.13.hook_resid_pre_32768:v11"
@@ -327,10 +332,10 @@ def main():
     # 3. Tokenize some training instructions for both classes
     n_inst_train = 4  # just a small number for demonstration
     template = QWEN_CHAT_TEMPLATE
-    tokenize_fn = functools.partial(tokenize_instructions, tokenizer=model.tokenizer, template=template)
+    tokenize_fn = partial(tokenize_instructions, tokenizer=model.tokenizer, template=template)
 
-    harmful_toks = tokenize_fn(harmful_inst_train[:n_inst_train])
-    harmless_toks = tokenize_fn(harmless_inst_train[:n_inst_train])
+    harmful_toks = tokenize_fn(instructions=harmful_inst_train[:n_inst_train])
+    harmless_toks = tokenize_fn(instructions=harmless_inst_train[:n_inst_train])
 
     # 4. Compute a top-down "refusal direction"
     chat_refusal_dir = extract_refusal_direction_top_down(
@@ -356,7 +361,7 @@ def main():
     # 6. Demonstrate hooking with "chat_refusal_dir" in subtract mode
     #    i.e. push away from "harmful direction".
     instructions_to_test = harmful_inst_test[:2]
-    test_toks = tokenize_fn(instructions_to_test)
+    test_toks = tokenize_fn(instructions=instructions_to_test)
 
     # Run steering with different modes
     steering_feature = 18316
@@ -406,7 +411,7 @@ def main():
         toks=test_toks,
         max_tokens_generated=64,
         fwd_hooks=[],  # No hooks
-        temperature=0.0
+        temperature=1.0
     )
 
     # Generate with steering
@@ -418,7 +423,7 @@ def main():
             toks=test_toks,
             max_tokens_generated=64,
             fwd_hooks=fwd_hooks[steering_name],
-            temperature=0.0
+            temperature=1.0
         )
 
     # Show results
@@ -431,8 +436,14 @@ def main():
     logger.info("Done!")
 
 
-# --------------------------------------------------------------------------------
-# 6. Entry Point
-# --------------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run refusal steering on Qwen model.")
+    parser.add_argument(
+        "--wandb_api_key",
+        type=str,
+        help="Optional: Weights & Biases API key (set as env variable if provided).",
+        default=None,
+    )
+    
+    args = parser.parse_args()
+    main(wandb_api_key=args.wandb_api_key)
