@@ -13,6 +13,7 @@ This script demonstrates how to:
 Author: [Your Name / Organization]
 """
 
+import pickle
 import argparse
 import os
 import logging
@@ -397,12 +398,12 @@ def main(wandb_api_key: str = None):
                 steering_vector=None,
                 mode="subtract_projection"
             )
-
-    fwd_hooks = {'top_down': [(utils.get_act_name('resid_pre', layer_of_interest), top_down_steer)],
+    intervention_layers = list(range(model.cfg.n_layers)) # all layers
+    fwd_hooks = {'top_down': [(utils.get_act_name(act_name, l), top_down_steer) for l in intervention_layers for act_name in ['resid_pre', 'resid_mid', 'resid_post']],
                  'hybrid': [(utils.get_act_name('resid_pre', layer_of_interest), hybrid_steer)],
                  'sae': [(utils.get_act_name('resid_pre', layer_of_interest), sae_steer)]}
     for sae_dir_name in sae_td_steers:
-        fwd_hooks[sae_dir_name] = [(utils.get_act_name('resid_pre', layer_of_interest), sae_td_steers[sae_dir_name])]
+        fwd_hooks[sae_dir_name] = [(utils.get_act_name(act_name, l), sae_td_steers[sae_dir_name]) for l in intervention_layers for act_name in ['resid_pre', 'resid_mid', 'resid_post']]
     # Generate with no steering
     logger.info("=== Generating baseline completions (no steering) ===")
     results = {}
@@ -425,7 +426,9 @@ def main(wandb_api_key: str = None):
             fwd_hooks=fwd_hooks[steering_name],
             temperature=1.0
         )
-
+    # Save results
+    with open("./completions.pkl", "wb") as f:
+        pickle.dump(results, f)
     # Show results
     print(f'Results: {results}')
 
