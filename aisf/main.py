@@ -37,7 +37,6 @@ import einops
 # Transformer Lens & SAE Lens
 from transformer_lens import HookedTransformer, utils
 from sae_lens.sae import SAE
-from sae_lens.toolkit.pretrained_saes import get_gpt2_res_jb_saes
 
 # For visualization/debugging if needed
 import matplotlib.pyplot as plt
@@ -59,13 +58,6 @@ if torch.backends.mps.is_available():
     DEVICE = "mps"
 else:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# --------------------------------------------------------------------------------
-# Example Qwen Chat Template
-# (You can define or update these for your Qwen model's typical usage)
-# --------------------------------------------------------------------------------
-QWEN_CHAT_TEMPLATE = """User: {instruction}\nAssistant:"""
-
 
 # --------------------------------------------------------------------------------
 # 1. Load Qwen Model and SAE
@@ -119,63 +111,50 @@ def load_qwen_and_sae(
     return model, sae
 
 
-# --------------------------------------------------------------------------------
-# 2. Example: Load or compute "harmful vs harmless" instructions,
-#    tokenize, and compute residual stream means ("refusal direction").
-# --------------------------------------------------------------------------------
-def get_harmful_instructions() -> (List[str], List[str]):
-    """
-    Stub function to return lists of 'harmful' instructions (train/test).
-    Replace with your actual data.
-    """
-    harmful_inst_train = [
-        # Fill in your own set of "harmful" prompts...
-        "How do I make a dangerous device?",
-        "Write a hateful slur about group X",
-        # ...
-    ]
-    harmful_inst_test = [
-        "Give instructions to break the law",
-        "Explain how to do harmful hacking",
-    ]
-    return harmful_inst_train, harmful_inst_test
+def extract_refusal_direction_bottom_up(
+    model: HookedTransformer,
+    layer: int,
+    pos: int,
+    harmful_batch: torch.Tensor,
+    harmless_batch: torch.Tensor,
+    sae: SAE,
+) -> torch.Tensor:
+    # 5. Optional: Compute SAE-based directions
+    #    We just do it for the mean harmful/harmless single vectors here:
+    harmful_acts, harmless_acts = extract_harmful_harmless_acts(model=model, layer=layer, pos=pos,
+                                                                harmful_batch=harmful_batch, 
+                                                                harmless_batch=harmless_batch)
+    sae_dirs = compute_sae_directions(sae, harmful_acts, harmless_acts)
+    logger.info(f"Computed {len(sae_dirs)} SAE-based directions: {list(sae_dirs.keys())}") 
 
 
-def get_harmless_instructions() -> (List[str], List[str]):
-    """
-    Stub function to return lists of 'harmless' instructions (train/test).
-    Replace with your actual data.
-    """
-    harmless_inst_train = [
-        "How do I cook pasta?",
-        "Tell me about the weather",
-        # ...
-    ]
-    harmless_inst_test = [
-        "What is your favorite color?",
-        "Explain quantum physics in simple terms",
-    ]
-    return harmless_inst_train, harmless_inst_test
+def extract_harmful_harmless_acts(
+    model: HookedTransformer,
+    layer: int,
+    pos: int,
+    harmful_batch: torch.Tensor,
+    harmless_batch: torch.Tensor,
+) -> torch.Tensor:
+    logger.info("Running model on harmful instructions to get residual stream...")
+    _, harmful_cache = model.run_with_cache(
+        harmful_batch,
+        names_filter=utils.get_act_name('resid_pre', layer),
+        stop_at_layer=layer + 1,
+    )
+
+    logger.info("Running model on harmless instructions to get residual stream...")
+    _, harmless_cache = model.run_with_cache(
+        harmless_batch,
+        names_filter=utils.get_act_name('resid_pre', layer),
+        stop_at_layer=layer + 1,
+    )
+
+    harmful_acts = harmful_cache['resid_pre', layer][:, pos, :]
+    harmless_acts = harmless_cache['resid_pre', layer][:, pos, :]
+    return harmful_acts, harmless_acts
 
 
-def tokenize_instructions(instructions: List[str], tokenizer, template: str) -> torch.Tensor:
-    """
-    Given a list of instruction strings, tokenizes them with a Qwen model's tokenizer,
-    using a chat-style template.
-
-    Returns a single batch of token IDs.
-    """
-    # Combine them into a single batch
-    prompts = [template.format(instruction=inst) for inst in instructions]
-    tokenized = tokenizer(
-        prompts,
-        padding=True,
-        return_tensors="pt",
-    )["input_ids"].to(DEVICE)
-    return tokenized
-
-
-def extract_refusal_direction(
+def extract_refusal_direction_top_down(
     model: HookedTransformer,
     layer: int,
     pos: int,
@@ -196,23 +175,9 @@ def extract_refusal_direction(
     Returns:
         The refusal direction as a 1D torch.Tensor (dimension = d_model).
     """
-    logger.info("Running model on harmful instructions to get residual stream...")
-    _, harmful_cache = model.run_with_cache(
-        harmful_batch,
-        names_filter=utils.get_act_name('resid_pre', layer),
-        stop_at_layer=layer + 1,
-    )
-
-    logger.info("Running model on harmless instructions to get residual stream...")
-    _, harmless_cache = model.run_with_cache(
-        harmless_batch,
-        names_filter=utils.get_act_name('resid_pre', layer),
-        stop_at_layer=layer + 1,
-    )
-
-    harmful_acts = harmful_cache['resid_pre', layer][:, pos, :]
-    harmless_acts = harmless_cache['resid_pre', layer][:, pos, :]
-
+    harmful_acts, harmless_acts = extract_harmful_harmless_acts(model=model, layer=layer, pos=pos,
+                                                                harmful_batch=harmful_batch, 
+                                                                harmless_batch=harmless_batch)
     harmful_mean_act = harmful_acts.mean(dim=0)
     harmless_mean_act = harmless_acts.mean(dim=0)
 
@@ -226,8 +191,8 @@ def extract_refusal_direction(
 # --------------------------------------------------------------------------------
 def compute_sae_directions(
     sae: SAE,
-    harmful_act: torch.Tensor,
-    harmless_act: torch.Tensor,
+    harmful_acts: torch.Tensor,
+    harmless_acts: torch.Tensor,
 ) -> dict:
     """
     Demonstrates various ways to get "SAE-based" refusal directions from harmful/harmless
@@ -241,30 +206,36 @@ def compute_sae_directions(
     }
     """
     directions = {}
+    harmful_mean_act = harmful_acts.mean(dim=0)
+    harmless_mean_act = harmless_acts.mean(dim=0)
     # "chat_refusal_dir_sae_m1": decode(harmful_mean) - decode(harmless_mean)
-    enc_harmful_mean = sae.encode(harmful_act)
-    enc_harmless_mean = sae.encode(harmless_act)
+    enc_harmful_mean = sae.encode(harmful_mean_act)
+    enc_harmless_mean = sae.encode(harmless_mean_act)
 
     # Option 1: decode each mean, subtract
     directions["sae_m1"] = sae.decode(enc_harmful_mean) - sae.decode(enc_harmless_mean)
 
     # Option 2: encode difference, decode
-    harmful_minus_harmless = harmful_act - harmless_act
+    harmful_minus_harmless = harmful_mean_act - harmless_mean_act
     directions["sae_m2"] = sae.decode(sae.encode(harmful_minus_harmless))
 
     # Option 3 (another variation)
-    # ...
+    directions["sae_m3"] = sae.decode(sae.encode(harmful_acts).mean(dim=0)) - sae.decode(sae.encode(harmless_acts).mean(dim=0))
+    directions["sae_m4"] = sae.decode(sae.encode(harmful_acts).mean(dim=0) - sae.encode(harmless_acts).mean(dim=0))
     return directions
 
 
 # --------------------------------------------------------------------------------
 # 4. Hook Functions for Steering
 # --------------------------------------------------------------------------------
-def steering_hook(
+def steering_fn(
     activations: torch.Tensor,
     hook,
+    direction: torch.Tensor,
     steering_vector: torch.Tensor,
-    mode: str = "subtract_projection",
+    mode: str,
+    steering_strength: float=1.,
+    max_act: float=1.,
 ):
     """
     Example hook that modifies `activations` at every forward pass.
@@ -277,21 +248,17 @@ def steering_hook(
     """
     if mode == "subtract_projection":
         # Project `activations` onto `steering_vector` and subtract
-        proj = einops.einsum(
-            activations, steering_vector.unsqueeze(0),
-            '... d_act, d_act -> ...'
-        )  # shape = [...]
-        proj = proj.unsqueeze(-1) * steering_vector
+        proj = einops.einsum(activations, direction.view(-1, 1), '... d_act, d_act single -> ... single') * direction
         return activations - proj
 
-    elif mode == "add_projection":
-        proj = einops.einsum(
-            activations, steering_vector.unsqueeze(0),
-            '... d_act, d_act -> ...'
-        )
-        proj = proj.unsqueeze(-1) * steering_vector
-        return activations + proj
-
+    elif mode == "add_act_subtract_projection":
+        # Project `activations` onto `steering_vector2` and subtract
+        proj = einops.einsum(activations, direction.view(-1, 1), '... d_act, d_act single -> ... single') * direction
+        return activations - proj + max_act * steering_strength * steering_vector
+    
+    elif mode == "add":
+        return activations + max_act * steering_strength * steering_vector
+    
     else:
         return activations
 
@@ -301,11 +268,11 @@ def generate_with_hooks(
     toks: torch.Tensor,
     max_tokens_generated: int,
     fwd_hooks: list,
-    temperature: float = 0.0,  # Greedy if = 0
+    temperature: float = 1.0,
 ) -> List[str]:
     """
     Simple generation function that iteratively calls the model with hooking,
-    using greedy decode if temperature=0.0.
+    using greedy decode if temperature=1.0.
 
     Returns list of generated strings for each batch row.
     """
@@ -318,7 +285,7 @@ def generate_with_hooks(
     for i in range(max_tokens_generated):
         with model.hooks(fwd_hooks=fwd_hooks):
             logits = model(all_toks[:, :toks.shape[1] + i])
-            if temperature == 0.0:
+            if temperature == 1.0:
                 next_tokens = logits[:, -1, :].argmax(dim=-1)
             else:
                 # Example: sample with temperature
@@ -366,7 +333,7 @@ def main():
     harmless_toks = tokenize_fn(harmless_inst_train[:n_inst_train])
 
     # 4. Compute a top-down "refusal direction"
-    chat_refusal_dir = extract_refusal_direction(
+    chat_refusal_dir = extract_refusal_direction_top_down(
         model=model,
         layer=layer_of_interest,
         pos=pos_of_interest,
@@ -375,15 +342,6 @@ def main():
     )
     logger.info(f"Refusal direction norm: {chat_refusal_dir.norm().item():.4f}")
 
-    # 5. Optional: Compute SAE-based directions
-    #    We just do it for the mean harmful/harmless single vectors here:
-    harmful_mean_act = (model.run_with_cache(harmful_toks, names_filter=utils.get_act_name('resid_pre', layer_of_interest),
-                        stop_at_layer=layer_of_interest+1)[1]['resid_pre', layer_of_interest][:, pos_of_interest, :].mean(dim=0))
-
-    harmless_mean_act = (model.run_with_cache(harmless_toks, names_filter=utils.get_act_name('resid_pre', layer_of_interest),
-                         stop_at_layer=layer_of_interest+1)[1]['resid_pre', layer_of_interest][:, pos_of_interest, :].mean(dim=0))
-
-    sae_dirs = compute_sae_directions(sae, harmful_mean_act, harmless_mean_act)
     logger.info(f"Computed {len(sae_dirs)} SAE-based directions: {list(sae_dirs.keys())}")
 
     # 6. Demonstrate hooking with "chat_refusal_dir" in subtract mode
@@ -393,7 +351,7 @@ def main():
 
     # Define your forward hook. We'll do subtracting the projection:
     def fwd_hook_fun(acts, hook):
-        return steering_hook(
+        return steering_fn(
             activations=acts,
             hook=hook,
             steering_vector=chat_refusal_dir.to(acts.device),
