@@ -392,16 +392,16 @@ def main():
                 steering_vector=None,
                 mode="subtract_projection"
             )
-    # We'll apply that hook at the same layer the direction was found
-    # (using 'resid_pre' naming from transformer_lens)
+
     fwd_hooks = {'top_down': [(utils.get_act_name('resid_pre', layer_of_interest), top_down_steer)],
                  'hybrid': [(utils.get_act_name('resid_pre', layer_of_interest), hybrid_steer)],
                  'sae': [(utils.get_act_name('resid_pre', layer_of_interest), sae_steer)]}
     for sae_dir_name in sae_td_steers:
         fwd_hooks[sae_dir_name] = [(utils.get_act_name('resid_pre', layer_of_interest), sae_td_steers[sae_dir_name])]
-    # 7. Generate with no steering
+    # Generate with no steering
     logger.info("=== Generating baseline completions (no steering) ===")
-    baseline = generate_with_hooks(
+    results = {}
+    results["baseline"] = generate_with_hooks(
         model=model,
         toks=test_toks,
         max_tokens_generated=64,
@@ -409,19 +409,20 @@ def main():
         temperature=0.0
     )
 
-    # 8. Generate with refusal direction steering
-    logger.info("=== Generating completions with refusal direction steering ===")
-    steered = generate_with_hooks(
-        model=model,
-        toks=test_toks,
-        max_tokens_generated=64,
-        fwd_hooks=fwd_hooks,
-        temperature=0.0
-    )
+    # Generate with steering
+    logger.info("=== Generating completions with different steering methods ===")
+    for steering_name in fwd_hooks:
+        logger.info(f"Steering method: {steering_name}")
+        results[steering_name] = generate_with_hooks(
+            model=model,
+            toks=test_toks,
+            max_tokens_generated=64,
+            fwd_hooks=fwd_hooks[steering_name],
+            temperature=0.0
+        )
 
     # Show results
-    for i, (inp, base_text, steer_text) in enumerate(zip(instructions_to_test, baseline, steered)):
-        print(f"\n--- Prompt: {inp} ---\nNo Steering:\n{base_text}\n\nSteered:\n{steer_text}\n{'='*60}")
+    print(f'Results: {results}')
 
     # Cleanup
     del harmful_inst_train, harmful_inst_test, harmless_inst_train, harmless_inst_test
