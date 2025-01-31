@@ -216,15 +216,15 @@ def compute_sae_directions(
     enc_harmless_mean = sae.encode(harmless_mean_act)
 
     # Option 1: decode each mean, subtract
-    directions["sae_m1"] = sae.decode(enc_harmful_mean) - sae.decode(enc_harmless_mean)
+    # directions["sae_m1"] = sae.decode(enc_harmful_mean) - sae.decode(enc_harmless_mean)
 
     # Option 2: encode difference, decode
     harmful_minus_harmless = harmful_mean_act - harmless_mean_act
-    directions["sae_m2"] = sae.decode(sae.encode(harmful_minus_harmless))
+    #directions["sae_m2"] = sae.decode(sae.encode(harmful_minus_harmless))
 
     # Option 3 (another variation)
     directions["sae_m3"] = sae.decode(sae.encode(harmful_acts).mean(dim=0)) - sae.decode(sae.encode(harmless_acts).mean(dim=0))
-    directions["sae_m4"] = sae.decode(sae.encode(harmful_acts).mean(dim=0) - sae.encode(harmless_acts).mean(dim=0))
+    #directions["sae_m4"] = sae.decode(sae.encode(harmful_acts).mean(dim=0) - sae.encode(harmless_acts).mean(dim=0))
     return directions
 
 
@@ -362,7 +362,7 @@ def main(wandb_api_key: str = None):
     )
     logger.info(f"Computed {len(sae_dirs)} SAE-based directions: {list(sae_dirs.keys())}")
 
-    N_INST_TEST = 5
+    N_INST_TEST = min(len(harmful_inst_test), len(harmless_inst_test))
     test_toks = {}
     test_toks["harmful"] = tokenize_fn(instructions=harmful_inst_test[:N_INST_TEST])
     test_toks["harmless"] = tokenize_fn(instructions=harmless_inst_test[:N_INST_TEST])
@@ -457,7 +457,7 @@ def main(wandb_api_key: str = None):
     for i in range(N_INST_TEST):
         for prompt_category in ["harmless", "harmful"]:
             for steering_name in results[prompt_category]:
-                completions[steering_name].append({"response": results[steering_name][i],
+                completions[steering_name].append({"response": results[prompt_category][steering_name][i],
                                                     "prompt": harmful_inst_test[i] if prompt_category == "harmful" else harmless_inst_test[i],
                                                     "category": prompt_category})
     del results
