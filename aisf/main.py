@@ -331,12 +331,15 @@ def main(wandb_api_key: str = None):
     harmless_inst_train, harmless_inst_test = get_harmless_instructions()
 
     # 3. Tokenize some training instructions for both classes
-    n_inst_train = 4  # just a small number for demonstration
+    n_inst_train = 32
     template = QWEN_CHAT_TEMPLATE
     tokenize_fn = partial(tokenize_instructions, tokenizer=model.tokenizer, template=template)
 
     harmful_toks = tokenize_fn(instructions=harmful_inst_train[:n_inst_train])
     harmless_toks = tokenize_fn(instructions=harmless_inst_train[:n_inst_train])
+
+    del harmful_inst_train, harmless_inst_train
+    gc.collect()
 
     # 4. Compute a top-down "refusal direction"
     chat_refusal_dir = extract_refusal_direction_top_down(
@@ -359,11 +362,10 @@ def main(wandb_api_key: str = None):
     )
     logger.info(f"Computed {len(sae_dirs)} SAE-based directions: {list(sae_dirs.keys())}")
 
-    # 6. Demonstrate hooking with "chat_refusal_dir" in subtract mode
-    #    i.e. push away from "harmful direction".
-    instructions_to_test = harmful_inst_test[:2]
-    test_toks = tokenize_fn(instructions=instructions_to_test)
-
+    N_INST_TEST = 5
+    test_toks = {}
+    test_toks["harmful"] = tokenize_fn(instructions=harmful_inst_test[:N_INST_TEST])
+    test_toks["harmless"] = tokenize_fn(instructions=harmless_inst_test[:N_INST_TEST])
     # Run steering with different modes
     steering_feature = 18316
     steering_vector = sae.W_dec[steering_feature].to(model.cfg.device)
@@ -375,6 +377,15 @@ def main(wandb_api_key: str = None):
         max_act=1.407,
         mode="add"
     )
+    # TODO: find negative feature
+    # sae_neg_steer = partial(
+    #     steering_fn,
+    #     direction=None,
+    #     steering_vector=steering_vector,
+    #     steering_strength=5.,
+    #     max_act=1.407,
+    #     mode="add"
+    # )
     top_down_steer = partial(
         steering_fn,
         direction=chat_refusal_dir.to(model.cfg.device)/chat_refusal_dir.norm(),
@@ -400,43 +411,67 @@ def main(wandb_api_key: str = None):
             )
     intervention_layers = list(range(model.cfg.n_layers)) # all layers
     fwd_hooks = {'top_down': [(utils.get_act_name(act_name, l), top_down_steer) for l in intervention_layers for act_name in ['resid_pre', 'resid_mid', 'resid_post']],
-                 'hybrid': [(utils.get_act_name('resid_pre', layer_of_interest), hybrid_steer)],
-                 'sae': [(utils.get_act_name('resid_pre', layer_of_interest), sae_steer)]}
+                 'hybrid': [(utils.get_act_name(act_name, layer_of_interest), hybrid_steer) for act_name in ['resid_pre', 'resid_mid', 'resid_post']],
+                 'hybrid2': [(utils.get_act_name('resid_pre', layer_of_interest), hybrid_steer)],
+                 'sae': [(utils.get_act_name(act_name, layer_of_interest), sae_steer) for act_name in ['resid_pre', 'resid_mid', 'resid_post']],
+                #  'sae_neg': [(utils.get_act_name(act_name, layer_of_interest), sae_neg_steer) for act_name in ['resid_pre', 'resid_mid', 'resid_post']]
+                }
+    for l in intervention_layers:
+        if intervention_layers != layer_of_interest:
+            fwd_hooks["hybrid2"].extend([(utils.get_act_name(act_name, l), top_down_steer) for act_name in ['resid_pre', 'resid_mid', 'resid_post']])
+    
     for sae_dir_name in sae_td_steers:
         fwd_hooks[sae_dir_name] = [(utils.get_act_name(act_name, l), sae_td_steers[sae_dir_name]) for l in intervention_layers for act_name in ['resid_pre', 'resid_mid', 'resid_post']]
     # Generate with no steering
     logger.info("=== Generating baseline completions (no steering) ===")
-    results = {}
-    results["baseline"] = generate_with_hooks(
-        model=model,
-        toks=test_toks,
-        max_tokens_generated=64,
-        fwd_hooks=[],  # No hooks
-        temperature=1.0
-    )
+    results = {'harmful': {}, 'harmless': {}}
+    for test_toks_name in test_toks:
+        results[test_toks_name]["baseline"] = generate_with_hooks(
+            model=model,
+            toks=test_toks[test_toks_name],
+            max_tokens_generated=64,
+            fwd_hooks=[],  # No hooks
+            temperature=1.0
+        )
 
     # Generate with steering
     logger.info("=== Generating completions with different steering methods ===")
     for steering_name in fwd_hooks:
         logger.info(f"Steering method: {steering_name}")
-        results[steering_name] = generate_with_hooks(
-            model=model,
-            toks=test_toks,
-            max_tokens_generated=64,
-            fwd_hooks=fwd_hooks[steering_name],
-            temperature=1.0
-        )
+        for test_toks_name in test_toks:
+            t = 1.0
+            if steering_name == "sae_m1" or steering_name == "sae_m2" or steering_name == "sae_m4":
+                t = 0.7
+            results[test_toks_name][steering_name] = generate_with_hooks(
+                model=model,
+                toks=test_toks[test_toks_name],
+                max_tokens_generated=64,
+                fwd_hooks=fwd_hooks[steering_name],
+                temperature=t
+            )
     # Save results
-    with open("./completions.pkl", "wb") as f:
+    with open("./results.pkl", "wb") as f:
         pickle.dump(results, f)
+    # Save completions
+    completions = {steering_name: [] for steering_name in results}
+    for i in range(N_INST_TEST):
+        for prompt_category in ["harmless", "harmful"]:
+            for steering_name in results[prompt_category]:
+                completions[steering_name].append({"response": results[steering_name][i],
+                                                    "prompt": harmful_inst_test[i] if prompt_category == "harmful" else harmless_inst_test[i],
+                                                    "category": prompt_category})
+    del results
+    with open("./completions.pkl", "wb") as f:
+        pickle.dump(completions, f)
     # Show results
     print(f'Results: {results}')
 
     # Cleanup
-    del harmful_inst_train, harmful_inst_test, harmless_inst_train, harmless_inst_test
+    del harmful_inst_test, harmless_inst_test
     gc.collect()
 
     logger.info("Done!")
+    return completions
 
 
 if __name__ == "__main__":
