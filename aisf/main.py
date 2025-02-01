@@ -1,16 +1,10 @@
-#!/usr/bin/env python3
-
 """
-Script: run_refusal_steering.py
-
-This script demonstrates how to:
-1. Load a Qwen model and corresponding Sparse Autoencoder (SAE) from Weights & Biases.
-2. Extract "refusal directions" (harmful vs. harmless instructions) using top-down mean-difference
-   and various SAE-based methods.
-3. Apply these steering vectors (via PyTorch hooks) to generate text completions
+This script:
+1. Loads a Qwen model and corresponding Sparse Autoencoder (SAE) from Weights & Biases.
+2. Extracts "refusal directions" (harmful vs. harmless instructions) using top-down mean-difference
+   and bottom-up steering: various SAE-based methods.
+3. Applies these steering vectors (via PyTorch hooks) to generate text completions
    that are steered (or un-steered) toward a refusal style.
-
-Author: [Your Name / Organization]
 """
 
 import pickle
@@ -28,22 +22,8 @@ import torch
 import wandb
 import einops
 
-# --- [Commented out: Typically, you'd install before running the script, rather than in-script] ---
-# os.system("pip install transformer_lens")
-# os.system("pip install wandb")
-# os.system("pip install plotly")
-# os.system("pip install sae_lens")
-# os.system("pip install colorama")
-# os.system("pip install vllm")
-# os.system("pip install litellm")
-
-# Transformer Lens & SAE Lens
 from transformer_lens import HookedTransformer, utils
 from sae_lens.sae import SAE
-
-# For visualization/debugging if needed
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 # --------------------------------------------------------------------------------
 # Logger Setup
@@ -63,7 +43,7 @@ else:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --------------------------------------------------------------------------------
-# 1. Load Qwen Model and SAE
+# Load Qwen Model and SAE
 # --------------------------------------------------------------------------------
 def load_qwen_and_sae(
     model_name: str,
@@ -122,8 +102,6 @@ def extract_refusal_direction_bottom_up(
     harmless_batch: torch.Tensor,
     sae: SAE,
 ) -> dict:
-    # 5. Optional: Compute SAE-based directions
-    #    We just do it for the mean harmful/harmless single vectors here:
     harmful_acts, harmless_acts = extract_harmful_harmless_acts(model=model, layer=layer, pos=pos,
                                                                 harmful_batch=harmful_batch, 
                                                                 harmless_batch=harmless_batch)
@@ -196,9 +174,6 @@ def extract_refusal_direction_top_down(
     return chat_refusal_dir
 
 
-# --------------------------------------------------------------------------------
-# 3. SAE-based "refusal direction" alternatives
-# --------------------------------------------------------------------------------
 def compute_sae_directions(
     sae: SAE,
     harmful_acts: torch.Tensor,
@@ -226,7 +201,7 @@ def compute_sae_directions(
     # directions["sae_m1"] = sae.decode(enc_harmful_mean) - sae.decode(enc_harmless_mean)
 
     # Option 2: encode difference, decode
-    harmful_minus_harmless = harmful_mean_act - harmless_mean_act
+    # harmful_minus_harmless = harmful_mean_act - harmless_mean_act
     #directions["sae_m2"] = sae.decode(sae.encode(harmful_minus_harmless))
 
     # Option 3 (another variation)
@@ -241,7 +216,7 @@ def compute_sae_directions(
 
 
 # --------------------------------------------------------------------------------
-# 4. Hook Functions for Steering
+# Hook Functions for Steering
 # --------------------------------------------------------------------------------
 def steering_fn(
     activations: torch.Tensor,
@@ -317,13 +292,13 @@ def generate_with_hooks(
 
 
 # --------------------------------------------------------------------------------
-# 5. Main or Demo Function
+# Main or Demo Function
 # --------------------------------------------------------------------------------
 def main(wandb_api_key: str = None):
     if wandb_api_key:
         os.environ["WANDB_API_KEY"] = wandb_api_key
         wandb.login(key=wandb_api_key)
-    # 1. Configuration (tweak these as you wish)
+    # 1. Configuration: tweak to reproduce for other models or associated SAEs
     qwen_model_name = "qwen1.5-0.5b-chat"
     artifact_path = "ckkissane/qwen-500M-chat-lmsys-1m-anthropic/sae_qwen1.5-0.5b-chat_blocks.13.hook_resid_pre_32768:v11"
     sae_local_path = "./artifacts/qwen-500M-chat-lmsys-1m-anthropic"
@@ -339,12 +314,12 @@ def main(wandb_api_key: str = None):
         estimated_norm_scaling_factor=estimated_norm_scaling_factor
     )
 
-    # 2. Load example instructions
+    # 2. Load training harmful/harmless instructions
     harmful_inst_train, harmful_inst_test = get_harmful_instructions()
     harmless_inst_train, harmless_inst_test = get_harmless_instructions()
 
-    # 3. Tokenize some training instructions for both classes
-    n_inst_train = 512
+    # 3. Tokenize a batch of training instructions for both classes
+    n_inst_train = 128
     template = QWEN_CHAT_TEMPLATE
     tokenize_fn = partial(tokenize_instructions, tokenizer=model.tokenizer, template=template)
 
@@ -354,7 +329,7 @@ def main(wandb_api_key: str = None):
     del harmful_inst_train, harmless_inst_train
     gc.collect()
 
-    # 4. Compute a top-down "refusal direction"
+    # 4. Compute "refusal direction" top-down
     chat_refusal_dir = extract_refusal_direction_top_down(
         model=model,
         layer=layer_of_interest,
@@ -364,7 +339,7 @@ def main(wandb_api_key: str = None):
     )
     logger.info(f"Refusal direction norm: {chat_refusal_dir.norm().item():.4f}")
 
-    # 5. Optional: Compute SAE-based directions
+    # 5. Compute SAE-based directions
     sae_dirs = extract_refusal_direction_bottom_up(
         model=model,
         layer=layer_of_interest,
@@ -384,7 +359,8 @@ def main(wandb_api_key: str = None):
     test_toks = {}
     test_toks["harmful"] = tokenize_fn(instructions=harmful_inst_test[:N_INST_TEST])
     test_toks["harmless"] = tokenize_fn(instructions=harmless_inst_test[:N_INST_TEST])
-    # Run steering with different modes
+
+    # 6. Run steering with different modes
     steering_feature = 18316
     steering_vector = sae.W_dec[steering_feature].to(model.cfg.device)
     sae_steer = partial(
@@ -440,7 +416,7 @@ def main(wandb_api_key: str = None):
     
     for sae_dir_name in sae_td_steers:
         fwd_hooks[sae_dir_name] = [(utils.get_act_name(act_name, l), sae_td_steers[sae_dir_name]) for l in intervention_layers for act_name in ['resid_pre', 'resid_mid', 'resid_post']]
-    # Generate with no steering
+    # 7. Generate with no steering
     logger.info("=== Generating baseline completions (no steering) ===")
     results = {'harmful': {}, 'harmless': {}}
     for test_toks_name in test_toks:
@@ -452,7 +428,7 @@ def main(wandb_api_key: str = None):
             temperature=1.0
         )
 
-    # Generate with steering
+    # 8. Generate with steering
     logger.info("=== Generating completions with different steering methods ===")
     for steering_name in fwd_hooks:
         logger.info(f"Steering method: {steering_name}")
@@ -467,10 +443,10 @@ def main(wandb_api_key: str = None):
                 fwd_hooks=fwd_hooks[steering_name],
                 temperature=t
             )
-    # Save results
+    # 9. Save results
     with open("./results.pkl", "wb") as f:
         pickle.dump(results, f)
-    # Save completions
+    # 10. Save completions
     completions = {steering_name: [] for steering_name in fwd_hooks}
     del fwd_hooks
     for i in range(N_INST_TEST):
@@ -481,10 +457,10 @@ def main(wandb_api_key: str = None):
                                                     "category": prompt_category})
     with open("./completions.pkl", "wb") as f:
         pickle.dump(completions, f)
-    # Show results
+    # 11. Show results
     print(f'Results: {results}')
 
-    # Cleanup
+    # 12. Cleanup
     del results, harmful_inst_test, harmless_inst_test
     gc.collect()
 
