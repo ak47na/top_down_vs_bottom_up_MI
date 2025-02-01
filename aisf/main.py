@@ -154,6 +154,10 @@ def extract_harmful_harmless_acts(
 
     harmful_acts = harmful_cache['resid_pre', layer][:, pos, :]
     harmless_acts = harmless_cache['resid_pre', layer][:, pos, :]
+    del harmful_cache, harmless_cache
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return harmful_acts, harmless_acts
 
 
@@ -185,6 +189,9 @@ def extract_refusal_direction_top_down(
     harmless_mean_act = harmless_acts.mean(dim=0)
 
     chat_refusal_dir = harmful_mean_act - harmless_mean_act
+    del harmful_mean_act, harmless_mean_act
+    torch.cuda.empty_cache()
+    gc.collect()
     logger.info(f"Extracted refusal direction from layer={layer}, pos={pos}")
     return chat_refusal_dir
 
@@ -225,6 +232,11 @@ def compute_sae_directions(
     # Option 3 (another variation)
     directions["sae_m3"] = sae.decode(sae.encode(harmful_acts).mean(dim=0)) - sae.decode(sae.encode(harmless_acts).mean(dim=0))
     #directions["sae_m4"] = sae.decode(sae.encode(harmful_acts).mean(dim=0) - sae.encode(harmless_acts).mean(dim=0))
+
+    # Free memory after computing SAE directions
+    del harmful_mean_act, harmless_mean_act, enc_harmful_mean, enc_harmless_mean
+    torch.cuda.empty_cache()
+    gc.collect()
     return directions
 
 
@@ -285,18 +297,19 @@ def generate_with_hooks(
     )
     all_toks[:, :toks.shape[1]] = toks
 
-    for i in range(max_tokens_generated):
-        with model.hooks(fwd_hooks=fwd_hooks):
-            logits = model(all_toks[:, :toks.shape[1] + i])
-            if temperature == 1.0:
-                next_tokens = logits[:, -1, :].argmax(dim=-1)
-            else:
-                # Example: sample with temperature
-                scaled_logits = logits[:, -1, :] / temperature
-                probs = torch.softmax(scaled_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    with torch.no_grad():  # Disable gradient tracking
+        for i in range(max_tokens_generated):
+            with model.hooks(fwd_hooks=fwd_hooks):
+                logits = model(all_toks[:, :toks.shape[1] + i])
+                if temperature == 1.0:
+                    next_tokens = logits[:, -1, :].argmax(dim=-1)
+                else:
+                    # Example: sample with temperature
+                    scaled_logits = logits[:, -1, :] / temperature
+                    probs = torch.softmax(scaled_logits, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-        all_toks[:, toks.shape[1] + i] = next_tokens
+            all_toks[:, toks.shape[1] + i] = next_tokens
 
     return model.tokenizer.batch_decode(
         all_toks[:, toks.shape[1]:], skip_special_tokens=True
@@ -331,7 +344,7 @@ def main(wandb_api_key: str = None):
     harmless_inst_train, harmless_inst_test = get_harmless_instructions()
 
     # 3. Tokenize some training instructions for both classes
-    n_inst_train = 32
+    n_inst_train = 512
     template = QWEN_CHAT_TEMPLATE
     tokenize_fn = partial(tokenize_instructions, tokenizer=model.tokenizer, template=template)
 
@@ -362,7 +375,12 @@ def main(wandb_api_key: str = None):
     )
     logger.info(f"Computed {len(sae_dirs)} SAE-based directions: {list(sae_dirs.keys())}")
 
+    del harmful_toks, harmless_toks
+    torch.cuda.empty_cache()
+    gc.collect()
+
     N_INST_TEST = min(len(harmful_inst_test), len(harmless_inst_test))
+    print(f'Num inst: {len(harmful_inst_test), len(harmless_inst_test)}')
     test_toks = {}
     test_toks["harmful"] = tokenize_fn(instructions=harmful_inst_test[:N_INST_TEST])
     test_toks["harmless"] = tokenize_fn(instructions=harmless_inst_test[:N_INST_TEST])
@@ -453,21 +471,21 @@ def main(wandb_api_key: str = None):
     with open("./results.pkl", "wb") as f:
         pickle.dump(results, f)
     # Save completions
-    completions = {steering_name: [] for steering_name in results}
+    completions = {steering_name: [] for steering_name in fwd_hooks}
+    del fwd_hooks
     for i in range(N_INST_TEST):
         for prompt_category in ["harmless", "harmful"]:
             for steering_name in results[prompt_category]:
                 completions[steering_name].append({"response": results[prompt_category][steering_name][i],
                                                     "prompt": harmful_inst_test[i] if prompt_category == "harmful" else harmless_inst_test[i],
                                                     "category": prompt_category})
-    del results
     with open("./completions.pkl", "wb") as f:
         pickle.dump(completions, f)
     # Show results
     print(f'Results: {results}')
 
     # Cleanup
-    del harmful_inst_test, harmless_inst_test
+    del results, harmful_inst_test, harmless_inst_test
     gc.collect()
 
     logger.info("Done!")
