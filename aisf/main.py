@@ -9,6 +9,7 @@ This script:
 
 import pickle
 import argparse
+from collections import defaultdict
 import os
 import logging
 import json
@@ -447,8 +448,8 @@ def main(wandb_api_key: str = None):
     with open("./results.pkl", "wb") as f:
         pickle.dump(results, f)
     # 10. Save completions
-    completions = {steering_name: [] for steering_name in fwd_hooks}
-    completions['baseline'] = []
+    completions = defaultdict(list)
+    
     del fwd_hooks
     for i in range(N_INST_TEST):
         for prompt_category in ["harmless", "harmful"]:
