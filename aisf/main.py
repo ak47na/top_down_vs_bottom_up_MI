@@ -449,6 +449,8 @@ def main(wandb_api_key: str = None):
         pickle.dump(results, f)
     # 10. Save completions
     completions = defaultdict(list)
+    if evaluate_loss:
+
     
     del fwd_hooks
     for i in range(N_INST_TEST):
