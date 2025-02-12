@@ -9,6 +9,7 @@ This script:
 
 import pickle
 import argparse
+from collections import defaultdict
 import os
 import logging
 import json
@@ -406,7 +407,7 @@ def main(wandb_api_key: str = None):
     intervention_layers = list(range(model.cfg.n_layers)) # all layers
     fwd_hooks = {'top_down': [(utils.get_act_name(act_name, l), top_down_steer) for l in intervention_layers for act_name in ['resid_pre', 'resid_mid', 'resid_post']],
                  'hybrid': [(utils.get_act_name(act_name, layer_of_interest), hybrid_steer) for act_name in ['resid_pre', 'resid_mid', 'resid_post']],
-                 'hybrid2': [(utils.get_act_name('resid_pre', layer_of_interest), hybrid_steer)],
+                 'hybrid2': [(utils.get_act_name(act_name, layer_of_interest), hybrid_steer) for act_name in ['resid_pre', 'resid_mid', 'resid_post']],
                  'sae': [(utils.get_act_name(act_name, layer_of_interest), sae_steer) for act_name in ['resid_pre', 'resid_mid', 'resid_post']],
                 #  'sae_neg': [(utils.get_act_name(act_name, layer_of_interest), sae_neg_steer) for act_name in ['resid_pre', 'resid_mid', 'resid_post']]
                 }
@@ -447,7 +448,10 @@ def main(wandb_api_key: str = None):
     with open("./results.pkl", "wb") as f:
         pickle.dump(results, f)
     # 10. Save completions
-    completions = {steering_name: [] for steering_name in fwd_hooks}
+    completions = defaultdict(list)
+    if evaluate_loss:
+
+    
     del fwd_hooks
     for i in range(N_INST_TEST):
         for prompt_category in ["harmless", "harmful"]:
